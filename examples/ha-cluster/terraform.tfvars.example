@@ -1,0 +1,27 @@
+# VMware vSphere
+vsphere_user          = "administrator@vsphere.local"
+vsphere_server        = "vcenter.example.local"
+vsphere_datacenter    = "datacenter"
+vsphere_datastore     = "datastore"
+vsphere_network       = "network"
+vsphere_resource_pool = "resource-pool"
+vsphere_folder        = "DevOps"
+talos_template_name   = "talos-template"
+
+# Talos Kubernetes
+cluster_name        = "talos-kubernetes"
+control_plane_vip   = "192.168.43.20"
+talos_version       = "v1.14.6"
+kubernetes_version  = "v1.37.0"
+bootstrap_node_name = "talos-control-plane-1"
+
+# NTP
+ntp_servers = [
+  "192.168.43.2"
+]
+
+# Windows Git Bash only
+# bash_interpreter = "C:/Program Files/Git/bin/bash.exe"
+
+# Do not store the vSphere password in this file.
+# Set it through TF_VAR_vsphere_password instead.

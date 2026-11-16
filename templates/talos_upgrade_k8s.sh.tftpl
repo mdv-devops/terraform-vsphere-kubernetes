@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENDPOINT="${endpoint}"
+KUBERNETES_VERSION="${kubernetes_version}"
+
+TEMP_DIR="$(mktemp -d)"
+chmod 700 "$TEMP_DIR"
+
+cleanup() {
+  rm -rf "$TEMP_DIR"
+}
+
+trap cleanup EXIT
+
+export TALOSCONFIG="$TEMP_DIR/talosconfig"
+export KUBECONFIG="$TEMP_DIR/kubeconfig"
+
+printf '%s' "$TALOSCONFIG_CONTENT" > "$TALOSCONFIG"
+printf '%s' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"
+
+chmod 600 "$TALOSCONFIG" "$KUBECONFIG"
+
+unset TALOSCONFIG_CONTENT KUBECONFIG_CONTENT
+
+echo "Checking Talos cluster health..."
+
+talosctl --talosconfig "$TALOSCONFIG" --endpoints "$ENDPOINT" --nodes "$ENDPOINT" health
+
+echo "Checking initialization marker..."
+
+if ! kubectl -n kube-system get configmap terraform-cluster-initialized >/dev/null 2>&1; then
+  echo "Initial bootstrap detected. Skipping Kubernetes upgrade."
+
+  kubectl -n kube-system create configmap terraform-cluster-initialized \
+    --from-literal=initialized=true
+
+  echo "Cluster initialization marker created."
+  exit 0
+fi
+
+echo "Cluster already initialized."
+echo "Synchronizing Kubernetes manifests..."
+
+talosctl --talosconfig "$TALOSCONFIG" \
+  --endpoints "$ENDPOINT" \
+  --nodes "$ENDPOINT" \
+  upgrade-k8s --to "$KUBERNETES_VERSION"
+
+echo "Checking cluster health after synchronization..."
+
+talosctl --talosconfig "$TALOSCONFIG" --endpoints "$ENDPOINT" --nodes "$ENDPOINT" health
+
+echo "Kubernetes manifest synchronization completed."

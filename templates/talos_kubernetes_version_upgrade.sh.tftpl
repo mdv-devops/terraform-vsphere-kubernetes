@@ -1,0 +1,93 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENDPOINT="${endpoint}"
+TARGET_VERSION="${kubernetes_version}"
+
+TEMP_DIR="$(mktemp -d)"
+chmod 700 "$TEMP_DIR"
+
+cleanup() {
+  rm -rf "$TEMP_DIR"
+}
+
+trap cleanup EXIT
+
+export TALOSCONFIG="$TEMP_DIR/talosconfig"
+export KUBECONFIG="$TEMP_DIR/kubeconfig"
+
+printf '%s' "$TALOSCONFIG_CONTENT" > "$TALOSCONFIG"
+printf '%s' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"
+
+chmod 600 "$TALOSCONFIG" "$KUBECONFIG"
+
+unset TALOSCONFIG_CONTENT KUBECONFIG_CONTENT
+
+get_kubernetes_version() {
+  kubectl --kubeconfig "$KUBECONFIG" version -o json |
+    sed -n '/"serverVersion"[[:space:]]*:/,$ s/.*"gitVersion"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' |
+    head -n 1
+}
+
+echo "Checking Kubernetes API connectivity..."
+
+if ! kubectl --kubeconfig "$KUBECONFIG" cluster-info >/dev/null 2>&1; then
+  echo "ERROR: Cannot connect to Kubernetes API" >&2
+  exit 1
+fi
+
+echo "Detecting current Kubernetes version..."
+
+CURRENT_VERSION="$(get_kubernetes_version)"
+
+if [[ -z "$CURRENT_VERSION" ]]; then
+  echo "ERROR: Cannot determine Kubernetes server version" >&2
+  exit 1
+fi
+
+echo "Current Kubernetes version: $CURRENT_VERSION"
+echo "Target Kubernetes version:  $TARGET_VERSION"
+
+if [[ "$CURRENT_VERSION" == "$TARGET_VERSION" ]]; then
+  echo "Kubernetes is already at the target version."
+  echo "Skipping Kubernetes upgrade."
+  exit 0
+fi
+
+echo "Checking Talos cluster health before upgrade..."
+
+talosctl \
+  --talosconfig "$TALOSCONFIG" \
+  --endpoints "$ENDPOINT" \
+  --nodes "$ENDPOINT" \
+  health
+
+echo "Starting Kubernetes upgrade: $CURRENT_VERSION -> $TARGET_VERSION"
+
+talosctl \
+  --talosconfig "$TALOSCONFIG" \
+  --endpoints "$ENDPOINT" \
+  --nodes "$ENDPOINT" \
+  upgrade-k8s --to "$TARGET_VERSION"
+
+echo "Checking Talos cluster health after upgrade..."
+
+talosctl \
+  --talosconfig "$TALOSCONFIG" \
+  --endpoints "$ENDPOINT" \
+  --nodes "$ENDPOINT" \
+  health
+
+echo "Verifying Kubernetes version..."
+
+UPDATED_VERSION="$(get_kubernetes_version)"
+
+if [[ "$UPDATED_VERSION" != "$TARGET_VERSION" ]]; then
+  echo "ERROR: Kubernetes version mismatch!" >&2
+  echo "Expected: $TARGET_VERSION" >&2
+  echo "Actual:   $UPDATED_VERSION" >&2
+  exit 1
+fi
+
+echo "Kubernetes successfully upgraded to $UPDATED_VERSION"
