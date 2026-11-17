@@ -2,8 +2,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask 077
+
+LOG_FILE="$PWD/kubernetes-upgrade.log"
+exec > >(tee "$LOG_FILE") 2>&1
+
 ENDPOINT="${endpoint}"
 TARGET_VERSION="${kubernetes_version}"
+TARGET_VERSION="$${TARGET_VERSION#v}"
 
 TEMP_DIR="$(mktemp -d)"
 chmod 700 "$TEMP_DIR"
@@ -14,28 +20,137 @@ cleanup() {
 
 trap cleanup EXIT
 
-export TALOSCONFIG="$TEMP_DIR/talosconfig"
-export KUBECONFIG="$TEMP_DIR/kubeconfig"
+TALOSCONFIG_FILE="$TEMP_DIR/talosconfig"
+KUBECONFIG_FILE="$TEMP_DIR/kubeconfig"
 
-printf '%s' "$TALOSCONFIG_CONTENT" > "$TALOSCONFIG"
-printf '%s' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"
+printf '%s' "$TALOSCONFIG_CONTENT" > "$TALOSCONFIG_FILE"
+printf '%s' "$KUBECONFIG_CONTENT" > "$KUBECONFIG_FILE"
 
-chmod 600 "$TALOSCONFIG" "$KUBECONFIG"
+chmod 600 "$TALOSCONFIG_FILE" "$KUBECONFIG_FILE"
 
 unset TALOSCONFIG_CONTENT KUBECONFIG_CONTENT
 
+# Windows Git Bash compatibility
+if command -v cygpath >/dev/null 2>&1; then
+  export TALOSCONFIG="$(cygpath -w "$TALOSCONFIG_FILE")"
+  export KUBECONFIG="$(cygpath -w "$KUBECONFIG_FILE")"
+else
+  export TALOSCONFIG="$TALOSCONFIG_FILE"
+  export KUBECONFIG="$KUBECONFIG_FILE"
+fi
+
+# --------------------------------------------------
+# Functions
+# --------------------------------------------------
+
 get_kubernetes_version() {
-  kubectl --kubeconfig "$KUBECONFIG" version -o json |
-    sed -n '/"serverVersion"[[:space:]]*:/,$ s/.*"gitVersion"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' |
-    head -n 1
+  local output
+
+  output="$(kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s version -o json)" || return 1
+
+  printf '%s\n' "$output" |
+    sed -n '/"serverVersion"/,/}/s/.*"gitVersion"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p'
 }
 
-echo "Checking Kubernetes API connectivity..."
+wait_for_kubernetes_api() {
+  local attempt
 
-if ! kubectl --kubeconfig "$KUBECONFIG" cluster-info >/dev/null 2>&1; then
-  echo "ERROR: Cannot connect to Kubernetes API" >&2
-  exit 1
-fi
+  echo "Waiting for Kubernetes API..."
+
+  for attempt in $(seq 1 60); do
+    if kubectl --kubeconfig "$KUBECONFIG" --request-timeout=5s get nodes >/dev/null 2>&1; then
+      echo "Kubernetes API is available"
+      return 0
+    fi
+
+    echo "Kubernetes API not ready ($attempt/60), retrying..."
+    sleep 10
+  done
+
+  echo "ERROR: Kubernetes API did not become available" >&2
+  echo "Last Kubernetes API error:" >&2
+  kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s get nodes >&2 || true
+
+  return 1
+}
+
+check_cluster_health() {
+  echo "Checking Talos cluster health..."
+
+  talosctl \
+    --talosconfig "$TALOSCONFIG" \
+    --endpoints "$ENDPOINT" \
+    --nodes "$ENDPOINT" \
+    health --wait-timeout 10m
+
+  echo "Talos cluster health: OK"
+}
+
+check_kubelet_versions() {
+  local versions
+  local version
+  local count=0
+
+  echo "Checking kubelet versions..."
+
+  versions="$(kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s get nodes -o custom-columns=VERSION:.status.nodeInfo.kubeletVersion --no-headers)" || return 1
+
+  if [[ -z "$versions" ]]; then
+    echo "ERROR: No Kubernetes nodes found" >&2
+    return 1
+  fi
+
+  while IFS= read -r version; do
+    version="$(printf '%s' "$version" | tr -d '\r')"
+    [[ -z "$version" ]] && continue
+
+    count=$((count + 1))
+
+    if [[ "$version" != "v$TARGET_VERSION" ]]; then
+      echo "ERROR: Kubelet version mismatch: $version (expected v$TARGET_VERSION)" >&2
+      return 1
+    fi
+  done <<< "$versions"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "ERROR: No kubelet versions found" >&2
+    return 1
+  fi
+
+  echo "All $count kubelets are running v$TARGET_VERSION"
+}
+
+wait_for_nodes_ready() {
+  echo "Waiting for all Kubernetes nodes to become Ready..."
+
+  kubectl \
+    --kubeconfig "$KUBECONFIG" \
+    --request-timeout=30s \
+    wait --for=condition=Ready nodes --all --timeout=10m
+
+  echo "All Kubernetes nodes are Ready"
+}
+
+# --------------------------------------------------
+# Initial information
+# --------------------------------------------------
+
+echo "=========================================="
+echo " Kubernetes Version Check / Upgrade"
+echo "=========================================="
+
+echo "Talos endpoint: $ENDPOINT"
+echo "Target Kubernetes version: v$TARGET_VERSION"
+
+# --------------------------------------------------
+# Wait for Kubernetes API
+# --------------------------------------------------
+
+wait_for_kubernetes_api
+
+# --------------------------------------------------
+# Detect current Kubernetes version
+# --------------------------------------------------
 
 echo "Detecting current Kubernetes version..."
 
@@ -46,48 +161,73 @@ if [[ -z "$CURRENT_VERSION" ]]; then
   exit 1
 fi
 
-echo "Current Kubernetes version: $CURRENT_VERSION"
-echo "Target Kubernetes version:  $TARGET_VERSION"
+echo "Current Kubernetes version: v$CURRENT_VERSION"
+echo "Target Kubernetes version:  v$TARGET_VERSION"
+
+# --------------------------------------------------
+# Skip if API server version matches
+# --------------------------------------------------
 
 if [[ "$CURRENT_VERSION" == "$TARGET_VERSION" ]]; then
-  echo "Kubernetes is already at the target version."
-  echo "Skipping Kubernetes upgrade."
+  echo "=========================================="
+  echo " SKIP: Kubernetes API server already at v$TARGET_VERSION"
+  echo "=========================================="
   exit 0
 fi
 
-echo "Checking Talos cluster health before upgrade..."
+# --------------------------------------------------
+# Upgrade Kubernetes
+# --------------------------------------------------
+
+echo "Kubernetes upgrade required:"
+echo "  Current: v$CURRENT_VERSION"
+echo "  Target:  v$TARGET_VERSION"
+
+check_cluster_health
+
+echo "Starting Kubernetes upgrade..."
 
 talosctl \
   --talosconfig "$TALOSCONFIG" \
   --endpoints "$ENDPOINT" \
   --nodes "$ENDPOINT" \
-  health
+  upgrade-k8s --to "v$TARGET_VERSION" \
+  --manifests-reconcile-timeout 15m
 
-echo "Starting Kubernetes upgrade: $CURRENT_VERSION -> $TARGET_VERSION"
+# --------------------------------------------------
+# Verify upgrade
+# --------------------------------------------------
 
-talosctl \
-  --talosconfig "$TALOSCONFIG" \
-  --endpoints "$ENDPOINT" \
-  --nodes "$ENDPOINT" \
-  upgrade-k8s --to "$TARGET_VERSION"
+echo "Waiting for Kubernetes API after upgrade..."
+
+wait_for_kubernetes_api
 
 echo "Checking Talos cluster health after upgrade..."
 
-talosctl \
-  --talosconfig "$TALOSCONFIG" \
-  --endpoints "$ENDPOINT" \
-  --nodes "$ENDPOINT" \
-  health
+check_cluster_health
 
-echo "Verifying Kubernetes version..."
+echo "Waiting for Kubernetes nodes..."
+
+wait_for_nodes_ready
+
+echo "Verifying Kubernetes API server version..."
 
 UPDATED_VERSION="$(get_kubernetes_version)"
 
 if [[ "$UPDATED_VERSION" != "$TARGET_VERSION" ]]; then
   echo "ERROR: Kubernetes version mismatch!" >&2
-  echo "Expected: $TARGET_VERSION" >&2
-  echo "Actual:   $UPDATED_VERSION" >&2
+  echo "Expected: v$TARGET_VERSION" >&2
+  echo "Actual:   v$UPDATED_VERSION" >&2
   exit 1
 fi
 
-echo "Kubernetes successfully upgraded to $UPDATED_VERSION"
+echo "Verifying kubelet versions..."
+
+if ! check_kubelet_versions; then
+  echo "ERROR: Not all kubelets are running v$TARGET_VERSION" >&2
+  exit 1
+fi
+
+echo "=========================================="
+echo " SUCCESS: Kubernetes upgraded to v$UPDATED_VERSION"
+echo "=========================================="

@@ -1,0 +1,177 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+LOG_FILE="$PWD/talos-os-upgrade.log"
+exec > >(tee "$LOG_FILE") 2>&1
+
+ENDPOINTS="${endpoints}"
+TARGET_VERSION="${talos_version}"
+CONTROL_PLANES="${control_plane_ips}"
+WORKERS="${worker_ips}"
+
+SCHEMATIC="376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
+INSTALLER_IMAGE="factory.talos.dev/vmware-installer/$SCHEMATIC:$TARGET_VERSION"
+
+TEMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEMP_DIR"' EXIT
+chmod 700 "$TEMP_DIR"
+
+export TALOSCONFIG="$TEMP_DIR/talosconfig"
+export KUBECONFIG="$TEMP_DIR/kubeconfig"
+printf '%s' "$TALOSCONFIG_CONTENT" > "$TALOSCONFIG"
+printf '%s' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"
+chmod 600 "$TALOSCONFIG" "$KUBECONFIG"
+unset TALOSCONFIG_CONTENT KUBECONFIG_CONTENT
+
+for tool in talosctl kubectl sort awk; do
+  command -v "$tool" >/dev/null || { echo "ERROR: $tool not found" >&2; exit 1; }
+done
+
+if [[ -z "$CONTROL_PLANES" ]]; then
+  echo 'ERROR: No control-plane nodes provided' >&2
+  exit 1
+fi
+
+talos() {
+  talosctl --talosconfig "$TALOSCONFIG" "$@"
+}
+
+get_endpoints() {
+  local excluded="$1" result="" node
+  for node in $CONTROL_PLANES; do
+    [[ "$node" == "$excluded" ]] && continue
+    if [[ -n "$result" ]]; then
+      result="$result,$node"
+    else
+      result="$node"
+    fi
+  done
+  [[ -n "$result" ]] || result="$excluded"
+  printf '%s\n' "$result"
+}
+
+get_version() {
+  local node="$1" endpoints="$2" output
+  output="$(talos --endpoints "$endpoints" --nodes "$node" version)" || return 1
+  printf '%s\n' "$output" | awk '/^Server:/{server=1; next} server && /Tag:/{print $2; exit}'
+}
+
+check_version_direction() {
+  local current="$1" target="$2" first
+  first="$(printf '%s\n%s\n' "$current" "$target" | sort -V | head -n 1)"
+  if [[ "$current" != "$target" && "$first" == "$target" ]]; then
+    echo "ERROR: Downgrade is not allowed: $current -> $target" >&2
+    return 1
+  fi
+}
+
+get_kubernetes_node() {
+  local ip="$1"
+  kubectl --kubeconfig "$KUBECONFIG" get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' |
+    awk -v ip="$ip" '$2 == ip {print $1; exit}'
+}
+
+check_node_ready() {
+  local ip="$1" name
+  name="$(get_kubernetes_node "$ip")"
+  if [[ -z "$name" ]]; then
+    echo "ERROR: Kubernetes node for $ip not found" >&2
+    return 1
+  fi
+  echo "Waiting for Kubernetes node $name to be Ready..."
+  kubectl --kubeconfig "$KUBECONFIG" wait "node/$name" --for=condition=Ready --timeout=10m
+}
+
+check_health() {
+  local excluded="$${1:-}" endpoints health_node="" node
+  endpoints="$(get_endpoints "$excluded")"
+  for node in $CONTROL_PLANES; do
+    if [[ "$node" != "$excluded" ]]; then
+      health_node="$node"
+      break
+    fi
+  done
+  if [[ -z "$health_node" ]]; then
+    echo 'ERROR: No control-plane node available for health check' >&2
+    return 1
+  fi
+  echo 'Checking cluster health...'
+  talos --endpoints "$endpoints" --nodes "$health_node" health --wait-timeout 10m
+  echo 'Cluster health: OK'
+}
+
+upgrade_node() {
+  local node="$1" role="$2" endpoints current actual
+  endpoints="$(get_endpoints "$node")"
+  echo
+  echo "=== $role: $node ==="
+  current="$(get_version "$node" "$endpoints")"
+  if [[ -z "$current" ]]; then
+    echo "ERROR: Could not determine Talos version on $node" >&2
+    return 1
+  fi
+  echo "Current: $current; target: $TARGET_VERSION"
+  if [[ "$current" == "$TARGET_VERSION" ]]; then
+    echo 'SKIP: target version already installed'
+    return 0
+  fi
+  check_version_direction "$current" "$TARGET_VERSION"
+  check_health "$node"
+  echo "Upgrading $node with $INSTALLER_IMAGE..."
+  talos --endpoints "$endpoints" --nodes "$node" upgrade --image "$INSTALLER_IMAGE" --wait --timeout 30m
+  actual="$(get_version "$node" "$endpoints")"
+  if [[ "$actual" != "$TARGET_VERSION" ]]; then
+    echo "ERROR: $node reports $actual, expected $TARGET_VERSION" >&2
+    return 1
+  fi
+  check_node_ready "$node"
+  check_health "$node"
+  echo "SUCCESS: $node is running $TARGET_VERSION"
+}
+
+echo '=== Talos OS rolling upgrade ==='
+echo "Target: $TARGET_VERSION"
+echo "Installer: $INSTALLER_IMAGE"
+echo "Control planes: $CONTROL_PLANES"
+echo "Workers: $WORKERS"
+
+NEEDS_UPGRADE=false
+for node in $CONTROL_PLANES $WORKERS; do
+  current="$(get_version "$node" "$ENDPOINTS")"
+  if [[ -z "$current" ]]; then
+    echo "ERROR: Could not determine Talos version on $node" >&2
+    exit 1
+  fi
+  echo "$node: $current (target: $TARGET_VERSION)"
+  if [[ "$current" != "$TARGET_VERSION" ]]; then
+    check_version_direction "$current" "$TARGET_VERSION"
+    NEEDS_UPGRADE=true
+  fi
+done
+
+if [[ "$NEEDS_UPGRADE" == "false" ]]; then
+  echo "SKIP: All nodes already run Talos $TARGET_VERSION"
+  exit 0
+fi
+
+check_health
+for node in $CONTROL_PLANES; do
+  upgrade_node "$node" 'control-plane'
+done
+for node in $WORKERS; do
+  upgrade_node "$node" 'worker'
+done
+
+echo '=== Final verification ==='
+for node in $CONTROL_PLANES $WORKERS; do
+  actual="$(get_version "$node" "$ENDPOINTS")"
+  if [[ "$actual" != "$TARGET_VERSION" ]]; then
+    echo "ERROR: $node reports $actual, expected $TARGET_VERSION" >&2
+    exit 1
+  fi
+  check_node_ready "$node"
+done
+check_health
+echo "SUCCESS: All nodes are running Talos $TARGET_VERSION"

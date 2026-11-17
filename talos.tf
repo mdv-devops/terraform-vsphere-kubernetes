@@ -1,5 +1,11 @@
 resource "talos_machine_secrets" "this" {
   talos_version = var.talos_version
+
+  lifecycle {
+    ignore_changes = [
+      talos_version
+    ]
+  }
 }
 
 resource "talos_machine_configuration_apply" "this" {

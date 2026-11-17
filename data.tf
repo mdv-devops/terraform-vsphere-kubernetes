@@ -29,8 +29,8 @@ data "talos_machine_configuration" "this" {
   cluster_name       = var.cluster_name
   cluster_endpoint   = var.cluster_endpoint
   machine_type       = each.value.role
-  talos_version      = var.talos_version
-  kubernetes_version = var.kubernetes_version
+  talos_version      = talos_machine_secrets.this.talos_version
+  kubernetes_version = terraform_data.kubernetes_bootstrap_version.output
   machine_secrets    = talos_machine_secrets.this.machine_secrets
 
   config_patches = concat(
