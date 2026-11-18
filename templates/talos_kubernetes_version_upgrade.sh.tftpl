@@ -11,6 +11,9 @@ ENDPOINT="${endpoint}"
 TARGET_VERSION="${kubernetes_version}"
 TARGET_VERSION="$${TARGET_VERSION#v}"
 
+CONTROL_PLANES="${control_plane_ips}"
+WORKERS="${worker_ips}"
+
 TEMP_DIR="$(mktemp -d)"
 chmod 700 "$TEMP_DIR"
 
@@ -37,6 +40,18 @@ if command -v cygpath >/dev/null 2>&1; then
 else
   export TALOSCONFIG="$TALOSCONFIG_FILE"
   export KUBECONFIG="$KUBECONFIG_FILE"
+fi
+
+for tool in talosctl kubectl sed awk tr seq; do
+  command -v "$tool" >/dev/null || {
+    echo "ERROR: $tool not found" >&2
+    exit 1
+  }
+done
+
+if [[ -z "$CONTROL_PLANES" ]]; then
+  echo "ERROR: No control-plane nodes provided" >&2
+  exit 1
 fi
 
 # --------------------------------------------------
@@ -68,10 +83,56 @@ wait_for_kubernetes_api() {
   done
 
   echo "ERROR: Kubernetes API did not become available" >&2
-  echo "Last Kubernetes API error:" >&2
   kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s get nodes >&2 || true
 
   return 1
+}
+
+get_kubernetes_node() {
+  local ip="$1"
+
+  kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' |
+    awk -v ip="$ip" '$2 == ip {print $1; exit}'
+}
+
+wait_for_expected_nodes() {
+  local ip name attempt
+
+  echo
+  echo "Waiting for expected Kubernetes nodes..."
+
+  for ip in $CONTROL_PLANES $WORKERS; do
+    name=""
+
+    for attempt in $(seq 1 60); do
+      name="$(get_kubernetes_node "$ip")"
+
+      if [[ -n "$name" ]]; then
+        echo "Registered: $name ($ip)"
+        break
+      fi
+
+      echo "Waiting for node $ip to register ($attempt/60)..."
+      sleep 10
+    done
+
+    if [[ -z "$name" ]]; then
+      echo "ERROR: Node $ip did not register within 10 minutes" >&2
+      return 1
+    fi
+
+    echo "Waiting for $name to become Ready..."
+
+    kubectl \
+      --kubeconfig "$KUBECONFIG" \
+      --request-timeout=30s \
+      wait "node/$name" \
+      --for=condition=Ready \
+      --timeout=10m
+  done
+
+  echo "All expected Kubernetes nodes are Ready"
 }
 
 check_cluster_health() {
@@ -87,33 +148,36 @@ check_cluster_health() {
 }
 
 check_kubelet_versions() {
-  local versions
-  local version
+  local ip name version
   local count=0
 
   echo "Checking kubelet versions..."
 
-  versions="$(kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s get nodes -o custom-columns=VERSION:.status.nodeInfo.kubeletVersion --no-headers)" || return 1
+  for ip in $CONTROL_PLANES $WORKERS; do
+    name="$(get_kubernetes_node "$ip")"
 
-  if [[ -z "$versions" ]]; then
-    echo "ERROR: No Kubernetes nodes found" >&2
-    return 1
-  fi
-
-  while IFS= read -r version; do
-    version="$(printf '%s' "$version" | tr -d '\r')"
-    [[ -z "$version" ]] && continue
-
-    count=$((count + 1))
-
-    if [[ "$version" != "v$TARGET_VERSION" ]]; then
-      echo "ERROR: Kubelet version mismatch: $version (expected v$TARGET_VERSION)" >&2
+    if [[ -z "$name" ]]; then
+      echo "ERROR: Kubernetes node with IP $ip not found" >&2
       return 1
     fi
-  done <<< "$versions"
+
+    version="$(kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s \
+      get node "$name" -o jsonpath='{.status.nodeInfo.kubeletVersion}')" || return 1
+
+    version="$(printf '%s' "$version" | tr -d '\r')"
+
+    echo "$name ($ip): $version"
+
+    if [[ "$version" != "v$TARGET_VERSION" ]]; then
+      echo "Kubelet version mismatch: $version (expected v$TARGET_VERSION)"
+      return 1
+    fi
+
+    count=$((count + 1))
+  done
 
   if [[ "$count" -eq 0 ]]; then
-    echo "ERROR: No kubelet versions found" >&2
+    echo "ERROR: No Kubernetes nodes found" >&2
     return 1
   fi
 
@@ -141,12 +205,15 @@ echo "=========================================="
 
 echo "Talos endpoint: $ENDPOINT"
 echo "Target Kubernetes version: v$TARGET_VERSION"
+echo "Control planes: $CONTROL_PLANES"
+echo "Workers: $WORKERS"
 
 # --------------------------------------------------
-# Wait for Kubernetes API
+# Wait for API and expected nodes
 # --------------------------------------------------
 
 wait_for_kubernetes_api
+wait_for_expected_nodes
 
 # --------------------------------------------------
 # Detect current Kubernetes version
@@ -165,12 +232,24 @@ echo "Current Kubernetes version: v$CURRENT_VERSION"
 echo "Target Kubernetes version:  v$TARGET_VERSION"
 
 # --------------------------------------------------
-# Skip if API server version matches
+# Check whether reconciliation is required
 # --------------------------------------------------
 
-if [[ "$CURRENT_VERSION" == "$TARGET_VERSION" ]]; then
+NEEDS_UPGRADE=false
+
+if [[ "$CURRENT_VERSION" != "$TARGET_VERSION" ]]; then
+  echo "Kubernetes API server version mismatch"
+  NEEDS_UPGRADE=true
+fi
+
+if ! check_kubelet_versions; then
+  echo "Kubelet version mismatch detected"
+  NEEDS_UPGRADE=true
+fi
+
+if [[ "$NEEDS_UPGRADE" == "false" ]]; then
   echo "=========================================="
-  echo " SKIP: Kubernetes API server already at v$TARGET_VERSION"
+  echo " SKIP: Kubernetes API and all kubelets already at v$TARGET_VERSION"
   echo "=========================================="
   exit 0
 fi
@@ -179,9 +258,9 @@ fi
 # Upgrade Kubernetes
 # --------------------------------------------------
 
-echo "Kubernetes upgrade required:"
-echo "  Current: v$CURRENT_VERSION"
-echo "  Target:  v$TARGET_VERSION"
+echo "Kubernetes reconciliation required:"
+echo "  Current API: v$CURRENT_VERSION"
+echo "  Target:      v$TARGET_VERSION"
 
 check_cluster_health
 
@@ -191,7 +270,8 @@ talosctl \
   --talosconfig "$TALOSCONFIG" \
   --endpoints "$ENDPOINT" \
   --nodes "$ENDPOINT" \
-  upgrade-k8s --to "v$TARGET_VERSION" \
+  upgrade-k8s \
+  --to "v$TARGET_VERSION" \
   --manifests-reconcile-timeout 15m
 
 # --------------------------------------------------
@@ -208,6 +288,7 @@ check_cluster_health
 
 echo "Waiting for Kubernetes nodes..."
 
+wait_for_expected_nodes
 wait_for_nodes_ready
 
 echo "Verifying Kubernetes API server version..."
@@ -229,5 +310,5 @@ if ! check_kubelet_versions; then
 fi
 
 echo "=========================================="
-echo " SUCCESS: Kubernetes upgraded to v$UPDATED_VERSION"
+echo " SUCCESS: Kubernetes reconciled to v$UPDATED_VERSION"
 echo "=========================================="

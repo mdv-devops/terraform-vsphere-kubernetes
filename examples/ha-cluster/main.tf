@@ -30,7 +30,7 @@ module "kubernetes" {
 
     nodes = {
       "control-plane-1" = {
-        cpu        = 3
+        cpu        = 2
         memory_mb  = 4096
         disk_gb    = 40
         ip_address = "192.168.43.10/24"

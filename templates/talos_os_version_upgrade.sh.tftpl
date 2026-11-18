@@ -2,6 +2,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+
 LOG_FILE="$PWD/talos-os-upgrade.log"
 exec > >(tee "$LOG_FILE") 2>&1
 
@@ -17,19 +18,33 @@ TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 chmod 700 "$TEMP_DIR"
 
-export TALOSCONFIG="$TEMP_DIR/talosconfig"
-export KUBECONFIG="$TEMP_DIR/kubeconfig"
-printf '%s' "$TALOSCONFIG_CONTENT" > "$TALOSCONFIG"
-printf '%s' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"
-chmod 600 "$TALOSCONFIG" "$KUBECONFIG"
+TALOSCONFIG_FILE="$TEMP_DIR/talosconfig"
+KUBECONFIG_FILE="$TEMP_DIR/kubeconfig"
+
+printf '%s' "$TALOSCONFIG_CONTENT" > "$TALOSCONFIG_FILE"
+printf '%s' "$KUBECONFIG_CONTENT" > "$KUBECONFIG_FILE"
+
+chmod 600 "$TALOSCONFIG_FILE" "$KUBECONFIG_FILE"
 unset TALOSCONFIG_CONTENT KUBECONFIG_CONTENT
 
-for tool in talosctl kubectl sort awk; do
-  command -v "$tool" >/dev/null || { echo "ERROR: $tool not found" >&2; exit 1; }
+# Windows Git Bash compatibility
+if command -v cygpath >/dev/null 2>&1; then
+  export TALOSCONFIG="$(cygpath -w "$TALOSCONFIG_FILE")"
+  export KUBECONFIG="$(cygpath -w "$KUBECONFIG_FILE")"
+else
+  export TALOSCONFIG="$TALOSCONFIG_FILE"
+  export KUBECONFIG="$KUBECONFIG_FILE"
+fi
+
+for tool in talosctl kubectl sort awk seq; do
+  command -v "$tool" >/dev/null || {
+    echo "ERROR: $tool not found" >&2
+    exit 1
+  }
 done
 
 if [[ -z "$CONTROL_PLANES" ]]; then
-  echo 'ERROR: No control-plane nodes provided' >&2
+  echo "ERROR: No control-plane nodes provided" >&2
   exit 1
 fi
 
@@ -39,27 +54,83 @@ talos() {
 
 get_endpoints() {
   local excluded="$1" result="" node
+
   for node in $CONTROL_PLANES; do
-    [[ "$node" == "$excluded" ]] && continue
+    if [[ "$node" == "$excluded" ]]; then
+      continue
+    fi
+
     if [[ -n "$result" ]]; then
       result="$result,$node"
     else
       result="$node"
     fi
   done
+
   [[ -n "$result" ]] || result="$excluded"
   printf '%s\n' "$result"
 }
 
 get_version() {
   local node="$1" endpoints="$2" output
+
   output="$(talos --endpoints "$endpoints" --nodes "$node" version)" || return 1
-  printf '%s\n' "$output" | awk '/^Server:/{server=1; next} server && /Tag:/{print $2; exit}'
+
+  printf '%s\n' "$output" |
+    awk '/^Server:/{server=1; next} server && /Tag:/{print $2; exit}'
+}
+
+# Wait until Talos API is available, regardless of version
+wait_for_talos_api() {
+  local node="$1" endpoints="$2" actual="" attempt
+
+  echo "Checking Talos API availability on $node..."
+  TALOS_DETECTED_VERSION=""
+
+  for attempt in $(seq 1 60); do
+    actual="$(get_version "$node" "$endpoints" 2>/dev/null || true)"
+
+    if [[ -n "$actual" ]]; then
+      TALOS_DETECTED_VERSION="$actual"
+      echo "Talos API available: $node ($actual)"
+      return 0
+    fi
+
+    echo "Waiting for Talos API on $node ($attempt/60)..."
+    sleep 10
+  done
+
+  echo "ERROR: Talos API on $node did not become available within 10 minutes" >&2
+  return 1
+}
+
+# Wait until upgraded node reports target Talos version
+wait_for_talos_version() {
+  local node="$1" endpoints="$2" actual="" attempt
+
+  echo "Waiting for Talos $TARGET_VERSION on $node..."
+
+  for attempt in $(seq 1 60); do
+    actual="$(get_version "$node" "$endpoints" 2>/dev/null || true)"
+
+    if [[ "$actual" == "$TARGET_VERSION" ]]; then
+      echo "Talos API ready: $node ($actual)"
+      return 0
+    fi
+
+    echo "Waiting for $node ($attempt/60), reported: $${actual:-unavailable}"
+    sleep 10
+  done
+
+  echo "ERROR: $node did not report Talos $TARGET_VERSION within 10 minutes" >&2
+  return 1
 }
 
 check_version_direction() {
   local current="$1" target="$2" first
+
   first="$(printf '%s\n%s\n' "$current" "$target" | sort -V | head -n 1)"
+
   if [[ "$current" != "$target" && "$first" == "$target" ]]; then
     echo "ERROR: Downgrade is not allowed: $current -> $target" >&2
     return 1
@@ -68,83 +139,141 @@ check_version_direction() {
 
 get_kubernetes_node() {
   local ip="$1"
-  kubectl --kubeconfig "$KUBECONFIG" get nodes \
+
+  kubectl --kubeconfig "$KUBECONFIG" --request-timeout=10s get nodes \
     -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' |
     awk -v ip="$ip" '$2 == ip {print $1; exit}'
 }
 
 check_node_ready() {
   local ip="$1" name
+
   name="$(get_kubernetes_node "$ip")"
+
   if [[ -z "$name" ]]; then
     echo "ERROR: Kubernetes node for $ip not found" >&2
     return 1
   fi
+
   echo "Waiting for Kubernetes node $name to be Ready..."
+
   kubectl --kubeconfig "$KUBECONFIG" wait "node/$name" --for=condition=Ready --timeout=10m
+}
+
+wait_for_nodes_ready() {
+  local node name attempt
+
+  echo
+  echo "=== Waiting for Kubernetes nodes ==="
+
+  for node in $CONTROL_PLANES $WORKERS; do
+    name=""
+
+    for attempt in $(seq 1 60); do
+      name="$(get_kubernetes_node "$node" 2>/dev/null || true)"
+
+      if [[ -n "$name" ]]; then
+        echo "Node $name ($node) registered"
+        break
+      fi
+
+      echo "Waiting for node $node to register ($attempt/60)..."
+      sleep 10
+    done
+
+    if [[ -z "$name" ]]; then
+      echo "ERROR: Kubernetes node $node did not register within 10 minutes" >&2
+      return 1
+    fi
+
+    echo "Waiting for node $name to become Ready..."
+
+    kubectl --kubeconfig "$KUBECONFIG" wait "node/$name" --for=condition=Ready --timeout=10m
+  done
+
+  echo "All expected Kubernetes nodes are Ready"
 }
 
 check_health() {
   local excluded="$${1:-}" endpoints health_node="" node
+
   endpoints="$(get_endpoints "$excluded")"
+
   for node in $CONTROL_PLANES; do
     if [[ "$node" != "$excluded" ]]; then
       health_node="$node"
       break
     fi
   done
+
+  # Single control-plane fallback
   if [[ -z "$health_node" ]]; then
-    echo 'ERROR: No control-plane node available for health check' >&2
+    for node in $CONTROL_PLANES; do
+      health_node="$node"
+      break
+    done
+  fi
+
+  if [[ -z "$health_node" ]]; then
+    echo "ERROR: No control-plane node available for health check" >&2
     return 1
   fi
-  echo 'Checking cluster health...'
+
+  echo "Checking cluster health..."
+
   talos --endpoints "$endpoints" --nodes "$health_node" health --wait-timeout 10m
-  echo 'Cluster health: OK'
+
+  echo "Cluster health: OK"
 }
 
 upgrade_node() {
-  local node="$1" role="$2" endpoints current actual
+  local node="$1" role="$2" endpoints current
+
   endpoints="$(get_endpoints "$node")"
+
   echo
   echo "=== $role: $node ==="
-  current="$(get_version "$node" "$endpoints")"
-  if [[ -z "$current" ]]; then
-    echo "ERROR: Could not determine Talos version on $node" >&2
-    return 1
-  fi
+
+  wait_for_talos_api "$node" "$endpoints"
+  current="$TALOS_DETECTED_VERSION"
+
   echo "Current: $current; target: $TARGET_VERSION"
+
   if [[ "$current" == "$TARGET_VERSION" ]]; then
-    echo 'SKIP: target version already installed'
+    echo "SKIP: target version already installed"
     return 0
   fi
+
   check_version_direction "$current" "$TARGET_VERSION"
   check_health "$node"
+
   echo "Upgrading $node with $INSTALLER_IMAGE..."
+
   talos --endpoints "$endpoints" --nodes "$node" upgrade --image "$INSTALLER_IMAGE" --wait --timeout 30m
-  actual="$(get_version "$node" "$endpoints")"
-  if [[ "$actual" != "$TARGET_VERSION" ]]; then
-    echo "ERROR: $node reports $actual, expected $TARGET_VERSION" >&2
-    return 1
-  fi
+
+  # Talos API may be unavailable briefly after reboot
+  wait_for_talos_version "$node" "$endpoints"
+
   check_node_ready "$node"
   check_health "$node"
+
   echo "SUCCESS: $node is running $TARGET_VERSION"
 }
 
-echo '=== Talos OS rolling upgrade ==='
+echo "=== Talos OS rolling upgrade ==="
 echo "Target: $TARGET_VERSION"
 echo "Installer: $INSTALLER_IMAGE"
 echo "Control planes: $CONTROL_PLANES"
 echo "Workers: $WORKERS"
 
 NEEDS_UPGRADE=false
+
 for node in $CONTROL_PLANES $WORKERS; do
-  current="$(get_version "$node" "$ENDPOINTS")"
-  if [[ -z "$current" ]]; then
-    echo "ERROR: Could not determine Talos version on $node" >&2
-    exit 1
-  fi
+  wait_for_talos_api "$node" "$ENDPOINTS"
+  current="$TALOS_DETECTED_VERSION"
+
   echo "$node: $current (target: $TARGET_VERSION)"
+
   if [[ "$current" != "$TARGET_VERSION" ]]; then
     check_version_direction "$current" "$TARGET_VERSION"
     NEEDS_UPGRADE=true
@@ -156,22 +285,31 @@ if [[ "$NEEDS_UPGRADE" == "false" ]]; then
   exit 0
 fi
 
+# Wait for newly added nodes to join Kubernetes
+wait_for_nodes_ready
+
+# Verify cluster health before rolling upgrade
 check_health
+
+# Upgrade control planes sequentially
 for node in $CONTROL_PLANES; do
-  upgrade_node "$node" 'control-plane'
-done
-for node in $WORKERS; do
-  upgrade_node "$node" 'worker'
+  upgrade_node "$node" "control-plane"
 done
 
-echo '=== Final verification ==='
+# Upgrade workers sequentially
+for node in $WORKERS; do
+  upgrade_node "$node" "worker"
+done
+
+echo
+echo "=== Final verification ==="
+
 for node in $CONTROL_PLANES $WORKERS; do
-  actual="$(get_version "$node" "$ENDPOINTS")"
-  if [[ "$actual" != "$TARGET_VERSION" ]]; then
-    echo "ERROR: $node reports $actual, expected $TARGET_VERSION" >&2
-    exit 1
-  fi
+  endpoints="$(get_endpoints "$node")"
+  wait_for_talos_version "$node" "$endpoints"
   check_node_ready "$node"
 done
+
 check_health
+
 echo "SUCCESS: All nodes are running Talos $TARGET_VERSION"
